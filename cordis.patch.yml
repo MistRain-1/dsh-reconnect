@@ -7,6 +7,9 @@
 #   - 标准临时错误、模型不存在/未配置错误和默认未知错误无限重试,QUOTA 默认不重试;
 #   - 指数退避:1s → 2s → 4s → ... 封顶 60s;服务端 Retry-After 作为最短等待直接尊重;
 #   - 回合中止、插件销毁或热重载时立即取消等待,不会留下悬挂 Promise。
+#
+# 配置(DSH 0.2.x):下面的 config 是默认值;设置页的表单由插件导出的 Config schema 生成,
+# 四个字段都是 volatile,在设置页保存后无需重启即可生效。
 - insert:
     - id: reconnect
       name: 'dsh-reconnect'
