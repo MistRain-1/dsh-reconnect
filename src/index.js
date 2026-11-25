@@ -1,32 +1,64 @@
-import z from "@deepseek-ai/schemastery";
-import { settingsNamespace } from "@deepseek-ai/dsh-settings";
-
 /**
  * ReConnect — 模型请求失败自动恢复(Host half)。
  *
  * 只处理 agent/request-error 中的模型请求失败。工具执行结果属于
  * tool/result,不在本插件的重试边界内;即使上游把工具错误包装成未知模型错误,
- * 未知错误是否限次由 settings 配置决定(默认无限);模型不存在或模型未配置属于
+ * 未知错误是否限次由配置决定(默认无限);模型不存在或模型未配置属于
  * 等待配置恢复的例外。
+ *
+ * DSH 0.2.x 配置契约(2.1.0 起):
+ *   - 不再使用 `@deepseek-ai/dsh-settings` 的 settingsNamespace / ctx.settings.register
+ *     (0.2.x 已移除,导入即失败);
+ *   - 设置表单由宿主根据导出的 `Config` schema 生成,可在线编辑的字段标记为 volatile;
+ *   - volatile 字段以 `{ get() }` 引用传入 apply(),每次请求失败时现读,保存即生效。
  */
 export const name = "reconnect";
-export const SETTINGS_NAMESPACE = "dsh-reconnect";
-const NS = settingsNamespace(SETTINGS_NAMESPACE);
-export const inject = ["settings"];
 
-const DEFAULTS = Object.freeze({
+const MAX_TIMER_MS = 2147483647;
+
+export const DEFAULTS = Object.freeze({
   maxDelayMs: 60000,
   retryQuota: false,
   retryUnknown: true,
   unknownMaxRetries: 3,
 });
 
-export const Config = z.object({
-  maxDelayMs: z.number().step(1).min(1000).max(2147483647).default(DEFAULTS.maxDelayMs),
-  retryQuota: z.boolean().default(DEFAULTS.retryQuota),
-  retryUnknown: z.boolean().default(DEFAULTS.retryUnknown),
-  unknownMaxRetries: z.number().step(1).min(0).max(100).default(DEFAULTS.unknownMaxRetries),
-});
+// schemastery 由宿主提供(peerDependency)。取不到时插件仍然可以加载并按默认值工作,
+// 只是没有设置表单;不能因为设置页的依赖问题让整个插件 "Did not load at start"。
+let schemastery;
+try {
+  ({ default: schemastery } = await import("@deepseek-ai/schemastery"));
+} catch {
+  schemastery = undefined;
+}
+
+/** `.volatile()` 需要 schemastery >= 3.18.4;更老的版本退回 meta 标记。 */
+function volatile(schema) {
+  if (typeof schema.volatile === "function") return schema.volatile();
+  if (typeof schema.extra === "function") return schema.extra("volatile", true);
+  return schema;
+}
+
+/** 为了可测试而独立出来:用给定的 schemastery 构造 Config;没有 schemastery 时返回 undefined。 */
+export function createConfig(z) {
+  if (!z || typeof z.object !== "function") return undefined;
+  return z.object({
+    maxDelayMs: volatile(z.number().step(1).min(1000).max(MAX_TIMER_MS)
+      .default(DEFAULTS.maxDelayMs)
+      .description("Max wait per attempt, in milliseconds. Caps the local exponential backoff (1s, 2s, 4s, ...); a provider Retry-After still wins.")),
+    retryQuota: volatile(z.boolean()
+      .default(DEFAULTS.retryQuota)
+      .description("Also retry QUOTA errors (insufficient balance / exhausted quota). Off by default.")),
+    retryUnknown: volatile(z.boolean()
+      .default(DEFAULTS.retryUnknown)
+      .description("Retry unknown errors (for example PI_AI_ERROR) indefinitely. When off, the cap below applies.")),
+    unknownMaxRetries: volatile(z.number().step(1).min(0).max(100)
+      .default(DEFAULTS.unknownMaxRetries)
+      .description("Max consecutive retries for unknown errors. Used only when unknown errors are not retried indefinitely; model-missing errors are never capped.")),
+  });
+}
+
+export const Config = createConfig(schemastery);
 
 // DSH 模型层标记的临时错误集合;STREAM_CLOSED 是异常流结束的传输类扩展。
 const TRANSIENT_CODES = new Set([
@@ -92,7 +124,7 @@ const MODEL_AVAILABILITY_MESSAGE_PATTERNS = [
 
 function normalizeConfig(value = {}) {
   const maxDelayMs = Number.isSafeInteger(value.maxDelayMs) && value.maxDelayMs >= 1000
-    ? Math.min(value.maxDelayMs, 2147483647)
+    ? Math.min(value.maxDelayMs, MAX_TIMER_MS)
     : DEFAULTS.maxDelayMs;
   const unknownMaxRetries = Number.isSafeInteger(value.unknownMaxRetries) && value.unknownMaxRetries >= 0
     ? Math.min(value.unknownMaxRetries, 100)
@@ -103,6 +135,24 @@ function normalizeConfig(value = {}) {
     retryUnknown: value.retryUnknown === undefined ? DEFAULTS.retryUnknown : value.retryUnknown === true,
     unknownMaxRetries,
   };
+}
+
+/** volatile 字段以 `{ get() }` 引用到达;普通值(旧宿主、patch 直写、测试)原样通过。 */
+function unwrap(value) {
+  return value !== null && typeof value === "object" && typeof value.get === "function"
+    ? value.get()
+    : value;
+}
+
+/** 每次请求失败时现读配置,所以设置页保存后无需重启即可生效。 */
+function readConfig(config) {
+  const source = config !== null && typeof config === "object" ? config : {};
+  return normalizeConfig({
+    maxDelayMs: unwrap(source.maxDelayMs),
+    retryQuota: unwrap(source.retryQuota),
+    retryUnknown: unwrap(source.retryUnknown),
+    unknownMaxRetries: unwrap(source.unknownMaxRetries),
+  });
 }
 
 function messageOf(failure) {
@@ -226,7 +276,7 @@ function providerRetryAfter(failure) {
     || !Number.isFinite(failure.providerRetryAfterMs) || failure.providerRetryAfterMs <= 0) {
     return undefined;
   }
-  return Math.min(Math.ceil(failure.providerRetryAfterMs), 2147483647);
+  return Math.min(Math.ceil(failure.providerRetryAfterMs), MAX_TIMER_MS);
 }
 
 /** 创建同时受回合和插件生命周期控制的退避等待。 */
@@ -250,20 +300,8 @@ function waitForRetry(delayMs, signals) {
   });
 }
 
-/** 安装 Host 重试监听器，并将插件配置接入宿主 settings。 */
+/** 安装 Host 重试监听器。配置来自 apply 的第二个参数(volatile 字段为 `{ get() }` 引用)。 */
 export function apply(ctx, config = {}) {
-  let live = normalizeConfig(config);
-  let unwatchSettings;
-  try {
-    // 第一层由 Cordis patch 提供默认值，第二层由 settings service 持久化用户覆盖。
-    const scope = ctx.settings.register(NS, Config, { base: config || {} });
-    live = normalizeConfig(scope.get());
-    unwatchSettings = scope.watch(() => {
-      live = normalizeConfig(scope.get());
-    });
-  } catch (error) {
-    console.warn(`[ReConnect] settings namespace unavailable, using composition config: ${error?.message || error}`);
-  }
   const lifetime = new AbortController();
   const active = new Set();
   let alive = true;
@@ -286,6 +324,7 @@ export function apply(ctx, config = {}) {
       const { agent, turn, step, provider, failure, signal } = payload;
       const code = failure && typeof failure.code === "string" ? failure.code : "UNKNOWN";
       const message = messageOf(failure);
+      const live = readConfig(config);
 
       if (!alive || signal?.aborted) return next();
       // llm-retry 的 always 实现会把恢复决定交给下游 waterfall;
@@ -365,7 +404,6 @@ export function apply(ctx, config = {}) {
     return () => {
       alive = false;
       lifetime.abort();
-      try { unwatchSettings?.(); } catch {}
       for (const dispose of disposers) {
         try { dispose(); } catch {}
       }

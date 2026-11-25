@@ -1,39 +1,33 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { apply, Config } from "../src/index.js";
+import { apply } from "../src/index.js";
 
-function createHarness(config = {}) {
+/**
+ * 模拟 DSH 0.2.x 加载器:volatile 字段以 `{ get() }` 引用传入 apply(ctx, config),
+ * 其余字段为普通值。`settings.set` 模拟设置页保存(loader 把新值写进同一个引用)。
+ */
+function createHarness(config = {}, { volatile = true } = {}) {
   const listeners = new Map();
   let cleanup;
-  const currentConfig = {
+  const values = {
     maxDelayMs: 1000,
     retryQuota: false,
     retryUnknown: true,
     unknownMaxRetries: 3,
     ...config,
   };
-  const watchers = new Set();
-  const settingsScope = {
-    get: () => ({ ...currentConfig }),
-    watch(listener) {
-      watchers.add(listener);
-      return () => watchers.delete(listener);
-    },
+  const passed = volatile
+    ? Object.fromEntries(Object.keys(values).map((key) => [key, { get: () => values[key] }]))
+    : { ...values };
+  const settings = {
+    get: () => ({ ...values }),
     set(field, value) {
-      currentConfig[field] = value;
-      for (const listener of watchers) listener();
+      values[field] = value;
+      if (!volatile) passed[field] = value;
       return Promise.resolve();
     },
   };
   const ctx = {
-    settings: {
-      register(namespace, schema, options) {
-        assert.equal(namespace.key || namespace, "dsh-reconnect");
-        assert.ok(schema);
-        assert.ok(options);
-        return settingsScope;
-      },
-    },
     on(event, listener) {
       listeners.set(event, listener);
       return () => listeners.delete(event);
@@ -42,7 +36,7 @@ function createHarness(config = {}) {
       cleanup = factory();
     },
   };
-  apply(ctx, config);
+  apply(ctx, passed);
   const session = {
     events: [],
     append(type, data) {
@@ -63,7 +57,7 @@ function createHarness(config = {}) {
   return {
     agent,
     session,
-    settings: settingsScope,
+    settings,
     signal,
     requestError,
     async dispose() {
@@ -81,13 +75,38 @@ function failure(code, providerRetryAfterMs = 1, message = "fixture failure") {
 }
 
 describe("ReConnect 重试策略", () => {
-  it("settings schema 默认开启未知错误无限重试", () => {
-    assert.deepEqual(Config({}), {
-      maxDelayMs: 60000,
-      retryQuota: false,
-      retryUnknown: true,
-      unknownMaxRetries: 3,
+  it("apply 不依赖 settings 服务:ctx 只需要 on/effect(0.2.x 没有 ctx.settings.register)", async () => {
+    const harness = createHarness({ maxDelayMs: 1000 });
+    assert.deepEqual(await harness.requestError(failure("SERVER")), { kind: "retry" });
+    await harness.dispose();
+  });
+
+  it("接受普通值配置(非 volatile / patch 直写),缺失字段回落到默认值", async () => {
+    const harness = createHarness({ maxDelayMs: 1000 }, { volatile: false });
+    assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
+    assert.equal(harness.session.events[0].data.mode, "always");
+    await harness.dispose();
+  });
+
+  it("apply(ctx) 不带配置也能工作,使用默认值", async () => {
+    const listeners = new Map();
+    let cleanup;
+    apply({
+      on(event, listener) { listeners.set(event, listener); return () => listeners.delete(event); },
+      effect(factory) { cleanup = factory(); },
     });
+    const events = [];
+    const result = await listeners.get("agent/request-error")({
+      agent: { session: { events, append(type, data) { events.push({ type, data }); } } },
+      turn: 1,
+      step: 1,
+      provider: "fixture",
+      failure: failure("SERVER", 1),
+      signal: new AbortController().signal,
+    }, () => ({ kind: "next" }));
+    assert.deepEqual(result, { kind: "retry" });
+    assert.equal(events[0].data.mode, "always");
+    await cleanup();
   });
 
   it("对临时错误重试并使用 durable 事件恢复计数", async () => {
@@ -311,7 +330,7 @@ describe("ReConnect 重试策略", () => {
     assert.deepEqual(await pending, { kind: "next" });
   });
 
-  it("settings 更新后立即改变未知错误策略", async () => {
+  it("设置页保存(volatile 引用更新)后下一次失败立即采用新策略", async () => {
     const harness = createHarness({ maxDelayMs: 1000, retryUnknown: false, unknownMaxRetries: 1 });
 
     assert.deepEqual(await harness.requestError(failure("PI_AI_ERROR")), { kind: "retry" });
